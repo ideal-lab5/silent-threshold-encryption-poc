@@ -1,0 +1,3 @@
+# Beacons and stuff...
+
+This is a 'toy' network thet uses silent threshold encryption to enable timelock encryption with silent setup.
