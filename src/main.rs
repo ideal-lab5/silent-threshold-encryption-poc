@@ -1,20 +1,38 @@
 mod node;
+// mod rpc;
+
 use crate::node::{Node, StartNodeParams};
 use anyhow::Result;
 use ark_ec::pairing::Pairing;
 use ark_poly::univariate::DensePolynomial;
-use ark_std::{rand::rngs::OsRng, UniformRand, Zero};
+use ark_std::{
+    rand::{rngs::OsRng, thread_rng},
+    UniformRand, Zero,
+};
 use clap::{Parser, Subcommand};
 use core::net::SocketAddr;
 use core::str::FromStr;
+use futures::{future, prelude::*};
 use iroh::{NodeAddr, NodeId, PublicKey as IrohPublicKey, RelayUrl, SecretKey as IrohSecretKey};
 use iroh_gossip::proto::TopicId;
+use n0_future::{time, time::Duration};
+use rand::distr::Uniform;
 use silent_threshold_encryption::{
     decryption::agg_dec,
     encryption::encrypt,
     kzg::KZG10,
     setup::{AggregateKey, LagrangePowers, PublicKey, SecretKey},
 };
+use std::net::{IpAddr, Ipv6Addr};
+use tarpc::{
+    client, context,
+    server::{self, Channel as _},
+    tokio_serde::formats::Json,
+};
+
+use tarpc::server::incoming::Incoming;
+
+use serde::Deserialize;
 
 type E = ark_bls12_381::Bls12_381;
 type G2 = <E as Pairing>::G2;
@@ -25,23 +43,44 @@ type UniPoly381 = DensePolynomial<<E as Pairing>::ScalarField>;
 // https://hackmd.io/xqYBrigYQwyKM_0Sn5Xf4w
 // https://eprint.iacr.org/2024/263.pdf
 
-/// Chat over iroh-gossip
-///
-/// This broadcasts signed messages over iroh-gossip and verifies signatures
-/// on received messages.
-///
-/// By default a new node id is created when starting the example. To reuse your identity,
-/// set the `--secret-key` flag with the secret key printed on a previous invocation.
-///
-/// By default, the relay server run by n0 is used. To use a local relay server, run
-///     cargo run --bin iroh-relay --features iroh-relay -- --dev
-/// in another terminal and then set the `-d http://localhost:3340` flag on this example.
+// use tonic::{transport::Server, Request, Response, Status};
+
+// pub mod hello {
+//     tonic::include_proto!("hello");
+// }
+// use hello::world_server::{World, WorldServer};
+// use hello::{HelloReply, HelloRequest};
+
+// #[derive(Default)]
+// pub struct MyWorld {
+
+// }
+
+// #[tonic::async_trait]
+// impl World for MyWorld {
+//     async fn hello(&self, request: Request<HelloRequest>) -> Result<Response<HelloReply>, Status> {
+//         let name = request.into_inner().name;
+
+//         // publish to gossipsub topic
+
+//         let reply = HelloReply {
+//             message: format!("Hello, {name}!"),
+//         };
+//         Ok(Response::new(reply))
+//     }
+// }
+
 #[derive(Parser, Debug)]
 #[command(name = "STE", version = "1.0")]
 struct Cli {
-    /// Set the bind port for our socket. By default, a random port will be used.
-    // #[arg(short, long, default_value = "9944")]
-    port: u16,
+    /// Port to bind for incoming connections
+    #[arg(long)]
+    bind_port: u16,
+
+    /// Port for the RPC interface
+    #[arg(long)]
+    rpc_port: u16,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -92,16 +131,9 @@ async fn main() -> Result<()> {
     if bootstrap_addrs.len() > 0 {
         bootstrap = Some(bootstrap_addrs);
     }
-
-    // start the RPC server
-    let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-    n0_future::task::spawn(
-
-    );
-
+    
     // run the node
-    // let bootstrap = bootstrap.clone();
-    let _ = Node::run(StartNodeParams::<E>::rand(topic, args.port, bootstrap)).await;
+    let _ = Node::run(StartNodeParams::<E>::rand(topic, args.bind_port, args.rpc_port, bootstrap)).await;
 
     Ok(())
 }
