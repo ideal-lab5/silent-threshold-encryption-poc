@@ -1,11 +1,3 @@
-//! Very basic example to showcase how to use iroh's APIs.
-//!
-//! This example implements a simple protocol that echos any data sent to it in the first stream.
-//!
-//! ## Usage
-//!
-//!     cargo run --example echo --features=examples
-
 use anyhow::Result;
 use iroh::{
     endpoint::Connection,
@@ -21,6 +13,7 @@ use n0_future::{task, StreamExt};
 
 use ark_ec::pairing::Pairing;
 use ark_poly::univariate::DensePolynomial;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{rand::rngs::OsRng, UniformRand, Zero};
 use silent_threshold_encryption::{
     decryption::agg_dec,
@@ -35,92 +28,34 @@ use std::{
     str::FromStr,
 };
 
-type E = ark_bls12_381::Bls12_381;
-type G2 = <E as Pairing>::G2;
-type Fr = <E as Pairing>::ScalarField;
-type UniPoly381 = DensePolynomial<<E as Pairing>::ScalarField>;
-use rand::{seq::IteratorRandom, thread_rng};
+use crate::types::*;
+use codec::{Decode, Encode};
+// use crate::rpc::*;
 
 pub struct Node<C: Pairing> {
+    /// the iroh endpoint
     endpoint: Endpoint,
+    /// the iroh router
     router: Router,
-    // the iroh-gossip communication layer
+    /// the iroh-gossip communication layer
     gossip: Gossip,
+    /// the gossip sneder
     gossip_sender: GossipSender,
-    gossip_receiver: GossipReceiver,
+    // gossip_receiver: GossipReceiver,
     iroh_secret_key: IrohSecretKey,
+    /// the bls secret key
     secret_key: SecretKey<C>,
-    known_hints: Option<Vec<u8>>,
+    /// the lagrange params
+    lagrange_params: LagrangePowers<C>,
+    // known_hints: Option<Vec<u8>>,
 }
 
-pub struct StartNodeParams<C: Pairing> {
-    iroh_secret_key: IrohSecretKey,
-    secret_key: SecretKey<C>,
-    topic: TopicId,
-    bind_port: u16,
-    rpc_port: u16,
-    bootstrap_peers: Option<Vec<NodeAddr>>,
-}
-
-impl<C: Pairing> StartNodeParams<C> {
-    pub fn rand(
-        topic: TopicId,
-        bind_port: u16,
-        rpc_port: u16,
-        bootstrap_peers: Option<Vec<NodeAddr>>,
-    ) -> Self {
-        Self {
-            iroh_secret_key: IrohSecretKey::generate(OsRng),
-            secret_key: SecretKey::<C>::new(&mut OsRng),
-            topic,
-            bind_port,
-            rpc_port,
-            bootstrap_peers,
-        }
-    }
-}
-
-pub enum Command {
-    Hint,
-    Preprocess,
-}
-
-use tonic::{transport::Server, Request, Response, Status};
-
-pub mod hello {
-    tonic::include_proto!("hello");
-}
-use hello::world_server::{World, WorldServer};
-use hello::{HelloReply, HelloRequest};
-
-// #[derive(Default)]
-pub struct MyWorld {
-    sender: GossipSender,
-}   
-
-impl MyWorld {
-    fn new(sender: GossipSender) -> Self {
-        Self { sender }
-    }
-}
-
-#[tonic::async_trait]
-impl World for MyWorld {
-    async fn hello(&self, request: Request<HelloRequest>) -> Result<Response<HelloReply>, Status> {
-        let name = request.into_inner().name;
-        let encoded = postcard::to_stdvec(&name).unwrap();
-        // publish to gossipsub topic
-        self.sender.broadcast(encoded.into()).await.unwrap();
-        let reply = HelloReply {
-            message: format!("Broadcasted message to gossipsub topic: {name}"),
-        };
-        Ok(Response::new(reply))
-    }
-}
+use crate::{MyWorld, WorldServer};
+use tonic::transport::Server;
 
 impl<C: Pairing> Node<C> {
     /// start the node
-    pub async fn run(params: StartNodeParams<C>) {
+    pub async fn build(params: StartNodeParams<C>) {
         //  -> Result<Self> {
         println!("Building the node... ");
         let endpoint = Endpoint::builder()
@@ -153,54 +88,86 @@ impl<C: Pairing> Node<C> {
         .unwrap()
         .split();
 
-        println!("The node is ready.");
+        let lagrange_params = LagrangePowers::<C>::new(params.tau, params.kzg_size);
 
-        n0_future::task::spawn(async move {
-            // start the RPC server
+        let mut node = Node {
+            endpoint,
+            router,
+            iroh_secret_key: params.iroh_secret_key,
+            secret_key: params.secret_key,
+            gossip,
+            gossip_sender: sender,
+            // gossip_receiver: receiver,
+            lagrange_params,
+        };
+
+        // start the RPC server
+        // n0_future::task::spawn(async move {
             let addr_str = format!("127.0.0.1:{}", params.rpc_port);
             let addr = addr_str.parse().unwrap();
-            let world = MyWorld::new(sender);
+            let world = MyWorld(node);
             println!("> Server listening on {}", addr);
             Server::builder()
                 .add_service(WorldServer::new(world))
                 .serve(addr)
                 .await
                 .unwrap();
-        });
-
-        // subscribe and print loop
+        // });
+        println!("asdfasdf");
         loop {
-            // task::spawn(subscribe_loop(receiver));
             while let Ok(Some(event)) = receiver.try_next().await {
                 if let Event::Gossip(GossipEvent::Received(msg)) = event {
-                    println!("RECEIVED MESSAGE {:?}", msg);
-                    // let (from, message) = SignedMessage::verify_and_decode(&msg.content)?;
-                    // match message {
-                    //     Message::AboutMe { name } => {
-                    //         names.insert(from, name.clone());
-                    //         println!("> {} is now known as {}", from.fmt_short(), name);
-                    //     }
-                    //     Message::Message { text } => {
-                    //         let name = names
-                    //             .get(&from)
-                    //             .map_or_else(|| from.fmt_short(), String::to_string);
-                    //         println!("{}: {}", name, text);
-                    //     }
-                    // }
+                    let announcement =
+                        Announcement::decode(&mut msg.content.to_vec().as_slice()).unwrap();
+                    match announcement.tag {
+                        Tag::Hint => {
+                            let pk = PublicKey::<E>::deserialize_compressed(&announcement.data[..])
+                                .unwrap();
+                        }
+                        _ => {
+                            todo!();
+                        }
+                    }
+                    println!("RECEIVED MESSAGE {:?}", announcement);
                 }
             }
         }
-
-        // Ok(Node {
-        //     endpoint,
-        //     router,
-        //     iroh_secret_key: params.iroh_secret_key,
-        //     secret_key: params.secret_key,
-        //     gossip,
-        //     gossip_sender: sender,
-        //     gossip_receiver: receiver,
-        // })
+        // node.listen().await;
     }
+
+    // // start the RPC server
+    // n0_future::task::spawn(async move {
+    //     let addr_str = format!("127.0.0.1:{}", params.rpc_port);
+    //     let addr = addr_str.parse().unwrap();
+    //     let world = MyWorld(node);
+    //     println!("> Server listening on {}", addr);
+    //     Server::builder()
+    //         .add_service(WorldServer::new(world))
+    //         .serve(addr)
+    //         .await
+    //         .unwrap();
+    // });
+    // subscribe and print loop
+    // pub async fn listen(&mut self) {
+    //     loop {
+    //         while let Ok(Some(event)) = self.gossip_receiver.try_next().await {
+    //             if let Event::Gossip(GossipEvent::Received(msg)) = event {
+    //                 let announcement =
+    //                     Announcement::decode(&mut msg.content.to_vec().as_slice()).unwrap();
+    //                 match announcement.tag {
+    //                     Tag::Hint => {
+    //                         let pk = PublicKey::<E>::deserialize_compressed(&announcement.data[..])
+    //                             .unwrap();
+    //                     }
+    //                     _ => {
+    //                         todo!();
+    //                     }
+    //                 }
+    //                 println!("RECEIVED MESSAGE {:?}", announcement);
+    //             }
+    //         }
+    //     }
+    // }
 
     /// join the gossip topic by connecting to known peers, if any
     async fn try_connect_peers(
@@ -229,168 +196,27 @@ impl<C: Pairing> Node<C> {
             .subscribe_and_join(topic, bootstrap_node_pubkeys)
             .await?;
 
-        println!("> gossipsub topic subscription initiated successfully");
+        println!("> Connection established.");
 
         Ok(gossipsub_topic)
     }
 
-    // pub async fn publish(msg: &[u8], topic: TopicId, peer_ids) -> Result<()> {
-    // let (sender, receiver) = gossip.subscribe_and_join(topic, peer_ids).await?.split();
-    // println!("> connected!");
+    pub(crate) fn lagrange_get_pk(&self, i: usize, size: usize) -> PublicKey<C> {
+        self.secret_key
+            .lagrange_get_pk(i, &self.lagrange_params, size)
+    }
 
-    // // broadcast our name, if set
-    // if let Some(name) = args.name {
-    //     let message = Message::AboutMe { name };
-    //     let encoded_message = SignedMessage::sign_and_encode(endpoint.secret_key(), &message)?;
-    //     sender.broadcast(encoded_message).await?;
-    // }
-    //     Ok(())
-    // }
+    pub(crate) async fn broadcast(&self, msg: bytes::Bytes) {
+        println!(":adsfadfasdf");
+        self.gossip_sender.broadcast(msg).await.unwrap();
+    }
 
     pub async fn addr(&self) -> Result<NodeAddr> {
         self.router.endpoint().node_addr().await
     }
-
-    // pub async fn send(&self, msg: &[u8]) -> Result<()> {
-    //     let (sender, _) = self.gossip_topic.split().clone();
-    //     sender.broadcast(postcard::from_bytes(msg).unwrap()).await?;
-    //     Ok(())
-    // }
-    // pub async fn connect(&self, node: Node<C>) -> Result<()> {
-    //     let addr = node.addr().await?;
-    //     self.endpoint.connect(addr, GOSSIP_ALPN).await?;
-    //     Ok(())
-    // }
 
     pub async fn shutdown(&mut self) -> Result<()> {
         self.router.shutdown().await?;
         Ok(())
     }
 }
-
-// async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
-//     // init a peerid -> name hashmap
-//     // let mut names = HashMap::new();
-//     while let Some(event) = receiver.try_next().await? {
-//         if let Event::Gossip(GossipEvent::Received(msg)) = event {
-//             println!("RECEIVED MESSAGE {:?}", msg);
-//             // let (from, message) = SignedMessage::verify_and_decode(&msg.content)?;
-//             // match message {
-//             //     Message::AboutMe { name } => {
-//             //         names.insert(from, name.clone());
-//             //         println!("> {} is now known as {}", from.fmt_short(), name);
-//             //     }
-//             //     Message::Message { text } => {
-//             //         let name = names
-//             //             .get(&from)
-//             //             .map_or_else(|| from.fmt_short(), String::to_string);
-//             //         println!("{}: {}", name, text);
-//             //     }
-//             // }
-//         }
-//     }
-//     Ok(())
-// }
-
-// #[derive(Debug, Serialize, Deserialize)]
-// struct SignedMessage {
-//     from: PublicKey,
-//     data: Bytes,
-//     signature: Signature,
-// }
-
-// impl SignedMessage {
-//     pub fn verify_and_decode(bytes: &[u8]) -> Result<(PublicKey, Message)> {
-//         let signed_message: Self = postcard::from_bytes(bytes)?;
-//         let key: PublicKey = signed_message.from;
-//         key.verify(&signed_message.data, &signed_message.signature)?;
-//         let message: Message = postcard::from_bytes(&signed_message.data)?;
-//         Ok((signed_message.from, message))
-//     }
-
-//     pub fn sign_and_encode(secret_key: &SecretKey, message: &Message) -> Result<Bytes> {
-//         let data: Bytes = postcard::to_stdvec(&message)?.into();
-//         let signature = secret_key.sign(&data);
-//         let from: PublicKey = secret_key.public();
-//         let signed_message = Self {
-//             from,
-//             data,
-//             signature,
-//         };
-//         let encoded = postcard::to_stdvec(&signed_message)?;
-//         Ok(encoded.into())
-//     }
-// }
-
-// pub async fn connect_side(addr: NodeAddr) -> Result<()> {
-//     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
-//     // Open a connection to the accepting node
-//     let conn = endpoint.connect(addr, ALPN).await?;
-//     // Open a bidirectional QUIC stream
-//     let (mut send, mut recv) = conn.open_bi().await?;
-//     // Send some data to be echoed
-//     send.write_all(b"Hello, world!").await?;
-//     // Signal the end of data for this particular stream
-//     send.finish()?;
-//     // Receive the echo, but limit reading up to maximum 1000 bytes
-//     let response = recv.read_to_end(1000).await?;
-//     assert_eq!(&response, b"Hello, world!");
-
-//     // Explicitly close the whole connection.
-//     conn.close(0u32.into(), b"bye!");
-
-//     // The above call only queues a close message to be sent (see how it's not async!).
-//     // We need to actually call this to make sure this message is sent out.
-//     endpoint.close().await;
-//     // If we don't call this, but continue using the endpoint, we then the queued
-//     // close call will eventually be picked up and sent.
-//     // But always try to wait for endpoint.close().await to go through before dropping
-//     // the endpoint to ensure any queued messages are sent through and connections are
-//     // closed gracefully.
-//     Ok(())
-// }
-
-// pub async fn start_accept_side() -> Result<Router> {
-//     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
-//     // Build our protocol handler and add our protocol,
-//     // identified by its ALPN, and spawn the node.
-//     let router = Router::builder(endpoint).accept(ALPN, Echo).spawn().await?;
-//     Ok(router)
-// }
-
-// #[derive(Debug, Clone)]
-// struct Echo;
-
-// impl ProtocolHandler for Echo {
-//     /// The `accept` method is called for each incoming connection for our ALPN.
-//     ///
-//     /// The returned future runs on a newly spawned tokio task, so it can run as long as
-//     /// the connection lasts.
-//     fn accept(&self, connection: Connection) -> BoxFuture<Result<()>> {
-//         // We have to return a boxed future from the handler.
-//         Box::pin(async move {
-//             // We can get the remote's node id from the connection.
-//             let node_id = connection.remote_node_id()?;
-//             println!("accepted connection from {node_id}");
-
-//             // Our protocol is a simple request-response protocol, so we expect the
-//             // connecting peer to open a single bi-directional stream.
-//             let (mut send, mut recv) = connection.accept_bi().await?;
-
-//             // Echo any bytes received back directly.
-//             // This will keep copying until the sender signals the end of data on the stream.
-//             let bytes_sent = tokio::io::copy(&mut recv, &mut send).await?;
-//             println!("Copied over {bytes_sent} byte(s)");
-
-//             // By calling `finish` on the send stream we signal that we will not send anything
-//             // further, which makes the receive stream on the other end terminate.
-//             send.finish()?;
-
-//             // Wait until the remote closes the connection, which it does once it
-//             // received the response.
-//             connection.closed().await;
-
-//             Ok(())
-//         })
-//     }
-// }
