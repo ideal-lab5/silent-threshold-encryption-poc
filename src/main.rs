@@ -8,13 +8,13 @@ use core::net::SocketAddr;
 use core::str::FromStr;
 use futures::prelude::*;
 use iroh::{NodeAddr, PublicKey as IrohPublicKey};
-use iroh_gossip::proto::TopicId;
+use iroh_gossip::{net::{Event, GossipEvent}, proto::TopicId};
 use silent_threshold_encryption::setup::{AggregateKey, LagrangePowers, PublicKey, SecretKey};
 use std::io::prelude::*;
-use std::{fs, fs::OpenOptions};
 use std::sync::Arc;
+use std::{fs, fs::OpenOptions};
 use tokio::sync::Mutex;
-
+use codec::{Encode, Decode};
 // use tarpc::{
 //     client, context,
 //     server::{self, Channel as _},
@@ -158,46 +158,66 @@ async fn main() -> Result<()> {
             }
 
             // build the node
-            // let mut node = 
-            Node::build(StartNodeParams::<E>::rand(
+            let mut node = Node::build(StartNodeParams::<E>::rand(
                 topic,
                 *bind_port,
                 *rpc_port,
                 config.tau,
                 config.dummy,
                 3,
-                bootstrap,
+                bootstrap.clone(),
             ))
             .await;
 
-            // imposes a perpetual lock 
+            let (tx, mut rx) = node
+                .try_connect_peers(topic, bootstrap)
+                .await
+                .unwrap()
+                .split();
+
+            // imposes a perpetual lock
             // node.listen().await;
 
-            // // setup the RPC server
-            // let shared_node = Arc::new(Mutex::new(node));
-            // let addr_str = format!("127.0.0.1:{}", rpc_port);
-            // let addr = addr_str.parse().unwrap();
-            // let world = MyWorld(shared_node.clone());
-            // // Spawn gRPC server in a separate task
-            // let server_handle = n0_future::task::spawn(async move {
-            //     Server::builder()
-            //         .add_service(WorldServer::new(world))
-            //         .serve(addr)
-            //         .await
-            //         .unwrap()
-            // });
+            // setup the RPC server
+            let addr_str = format!("127.0.0.1:{}", rpc_port);
+            let addr = addr_str.parse().unwrap();
+            let world = MyWorld(node, tx);
+            // Spawn gRPC server in a separate task
+            let server_handle = n0_future::task::spawn(async move {
+                Server::builder()
+                    .add_service(WorldServer::new(world))
+                    .serve(addr)
+                    .await
+                    .unwrap()
+            });
 
-            // let listener_handler = n0_future::task::spawn(async move {
-            //     loop {
-            //         let mut node = shared_node.lock().await;
-            //         node.process_available_events().await;
-            //     }
-            // });
+            let listener_handler = n0_future::task::spawn(async move {
+                loop {
+                    while let Ok(Some(event)) = rx.try_next().await {
+                        if let Event::Gossip(GossipEvent::Received(msg)) = event {
+                            let announcement =
+                                Announcement::decode(&mut msg.content.to_vec().as_slice()).unwrap();
+                            match announcement.tag {
+                                Tag::Hint => {
+                                    let pk = PublicKey::<E>::deserialize_compressed(
+                                        &announcement.data[..],
+                                    )
+                                    .unwrap();
+                                }
+                                _ => {
+                                    todo!();
+                                }
+                            }
+                            println!("RECEIVED MESSAGE {:?}", announcement);
+                        }
+                    }
+                }
+            });
 
             // server_handle.await;
 
             // println!("> Server listening on {}", addr);
-            // tokio::try_join!(server_handle, listener_handler).unwrap();
+            tokio::try_join!(server_handle, listener_handler).unwrap();
         }
         None => {
             // do nothing

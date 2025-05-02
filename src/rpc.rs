@@ -43,7 +43,7 @@ pub mod hello {
 use hello::world_server::{World, WorldServer};
 use hello::{HelloReply, HelloRequest};
 
-pub struct MyWorld<C: Pairing>(pub(crate) Node<C>);
+pub struct MyWorld<C: Pairing>(pub(crate) Node<C>, pub(crate) GossipSender);
 
 #[tonic::async_trait]
 impl<C: Pairing> World for MyWorld<C> {
@@ -64,7 +64,7 @@ impl<C: Pairing> World for MyWorld<C> {
 
         let encoded = announcement.encode();
         // publish to gossipsub topic
-        node.broadcast(encoded.into());
+        self.1.broadcast(encoded.into()).await.unwrap();
 
         let reply = HelloReply {
             message: format!("Broadcasted message to gossipsub topic"),

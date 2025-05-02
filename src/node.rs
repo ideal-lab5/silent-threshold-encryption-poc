@@ -40,7 +40,7 @@ pub struct Node<C: Pairing> {
     /// the iroh-gossip communication layer
     gossip: Gossip,
     /// the gossip sneder
-    gossip_sender: GossipSender,
+    // gossip_sender: GossipSender,
     // gossip_receiver: GossipReceiver,
     iroh_secret_key: IrohSecretKey,
     /// the bls secret key
@@ -55,7 +55,7 @@ use tonic::transport::Server;
 
 impl<C: Pairing> Node<C> {
     /// start the node
-    pub async fn build(params: StartNodeParams<C>) {
+    pub async fn build(params: StartNodeParams<C>) -> Self {
         //  -> Result<Self> {
         println!("Building the node... ");
         let endpoint = Endpoint::builder()
@@ -77,61 +77,61 @@ impl<C: Pairing> Node<C> {
             .unwrap();
         let addr = router.endpoint().node_addr().await;
         println!("> Generated node address: {:?}", addr);
-
-        let (sender, mut receiver) = Self::try_connect_peers(
-            endpoint.clone(),
-            gossip.clone(),
-            params.topic,
-            params.bootstrap_peers.clone(),
-        )
-        .await
-        .unwrap()
-        .split();
-
         let lagrange_params = LagrangePowers::<C>::new(params.tau, params.kzg_size);
 
-        let mut node = Node {
+        Node {
             endpoint,
             router,
             iroh_secret_key: params.iroh_secret_key,
             secret_key: params.secret_key,
             gossip,
-            gossip_sender: sender,
+            // gossip_sender: sender,
             // gossip_receiver: receiver,
             lagrange_params,
-        };
-
-        // start the RPC server
-        // n0_future::task::spawn(async move {
-            let addr_str = format!("127.0.0.1:{}", params.rpc_port);
-            let addr = addr_str.parse().unwrap();
-            let world = MyWorld(node);
-            println!("> Server listening on {}", addr);
-            Server::builder()
-                .add_service(WorldServer::new(world))
-                .serve(addr)
-                .await
-                .unwrap();
-        // });
-        println!("asdfasdf");
-        loop {
-            while let Ok(Some(event)) = receiver.try_next().await {
-                if let Event::Gossip(GossipEvent::Received(msg)) = event {
-                    let announcement =
-                        Announcement::decode(&mut msg.content.to_vec().as_slice()).unwrap();
-                    match announcement.tag {
-                        Tag::Hint => {
-                            let pk = PublicKey::<E>::deserialize_compressed(&announcement.data[..])
-                                .unwrap();
-                        }
-                        _ => {
-                            todo!();
-                        }
-                    }
-                    println!("RECEIVED MESSAGE {:?}", announcement);
-                }
-            }
         }
+
+
+        // let (sender, mut receiver) = Self::try_connect_peers(
+        //     endpoint.clone(),
+        //     gossip.clone(),
+        //     params.topic,
+        //     params.bootstrap_peers.clone(),
+        // )
+        // .await
+        // .unwrap()
+        // .split();
+
+        // // start the RPC server
+        // // n0_future::task::spawn(async move {
+        //     let addr_str = format!("127.0.0.1:{}", params.rpc_port);
+        //     let addr = addr_str.parse().unwrap();
+        //     let world = MyWorld(node);
+        //     println!("> Server listening on {}", addr);
+        //     Server::builder()
+        //         .add_service(WorldServer::new(world))
+        //         .serve(addr)
+        //         .await
+        //         .unwrap();
+        // // });
+        // println!("asdfasdf");
+        // loop {
+        //     while let Ok(Some(event)) = receiver.try_next().await {
+        //         if let Event::Gossip(GossipEvent::Received(msg)) = event {
+        //             let announcement =
+        //                 Announcement::decode(&mut msg.content.to_vec().as_slice()).unwrap();
+        //             match announcement.tag {
+        //                 Tag::Hint => {
+        //                     let pk = PublicKey::<E>::deserialize_compressed(&announcement.data[..])
+        //                         .unwrap();
+        //                 }
+        //                 _ => {
+        //                     todo!();
+        //                 }
+        //             }
+        //             println!("RECEIVED MESSAGE {:?}", announcement);
+        //         }
+        //     }
+        // }
         // node.listen().await;
     }
 
@@ -170,9 +170,8 @@ impl<C: Pairing> Node<C> {
     // }
 
     /// join the gossip topic by connecting to known peers, if any
-    async fn try_connect_peers(
-        endpoint: Endpoint,
-        gossip: Gossip,
+    pub async fn try_connect_peers(
+        &mut self,
         topic: TopicId,
         peers: Option<Vec<NodeAddr>>,
     ) -> Result<GossipTopic> {
@@ -183,7 +182,7 @@ impl<C: Pairing> Node<C> {
                 println!("> trying to connect to {} peer(s)", bootstrap.len());
                 // add the peer addrs to our endpoint's addressbook so that they can be dialed
                 for peer in bootstrap.into_iter() {
-                    endpoint.add_node_addr(peer)?;
+                    self.endpoint.add_node_addr(peer)?;
                 }
                 bootstrap_node_pubkeys = peer_ids;
             }
@@ -192,7 +191,7 @@ impl<C: Pairing> Node<C> {
             }
         };
 
-        let gossipsub_topic = gossip
+        let gossipsub_topic = self.gossip
             .subscribe_and_join(topic, bootstrap_node_pubkeys)
             .await?;
 
@@ -208,7 +207,7 @@ impl<C: Pairing> Node<C> {
 
     pub(crate) async fn broadcast(&self, msg: bytes::Bytes) {
         println!(":adsfadfasdf");
-        self.gossip_sender.broadcast(msg).await.unwrap();
+        // self.gossip_sender.broadcast(msg).await.unwrap();
     }
 
     pub async fn addr(&self) -> Result<NodeAddr> {
