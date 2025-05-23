@@ -2,12 +2,12 @@
 
 This is a proof of concept of a distributed network that enables silent threshold encryption.
 
-## Usage
-
-1. start nodes
-2. generate initial hints & gossip
-3. compute aggregated key
-3. generate partial decryption
+1. start nodes as the 'workers' (x3)  and two more 'receivers' [done]
+2. RPC: call each rpc to get a 'hint' and store locally        [done]
+3. RPC: call your own rpc to preprocess keys &  save output to file [wip]
+4. CLI: encrypt a message
+5. RPC: get partial decryptions from workers
+5. CLI: decrypt a message
 
 ### Setup
 
@@ -15,12 +15,24 @@ cargo run -- setup --size 3 --out-dir config.txt
 
 ### bootstrap node
 
-cargo run -- run --bind-port 9944 --rpc-port 30333 --config-dir config.txt
+cargo run -- run --bind-port 9944 --rpc-port 30333 --is-bootstrap --index 0
 
-## second node
+### additional nodes
 
-cargo run -- run --bind-port 9945 --rpc-port 30334 --config-dir config.txt --bootstrap-pubkey fbfaec7a54fcf41562f7b03981fc9cf9efb2699d50030027355b1d6621f7ad27 --bootstrap-ip 172.31.149.62:9944
+cargo run -- run --bind-port 9945 --rpc-port 30334 --bootstrap-pubkey 0f691be8dbb96685cc260d0ab573f241c5cfba9c4be5377e4645643423075f62 --bootstrap-ip 172.31.149.62:9944 --ticket docaaacah3v3jkouvdfv7rvi5j2flkg5bwc45cfer6myy4r2jdaaqmplrlcaehwsg7i3o4wnbomeygqvnlt6ja4lt52trf6kn36izcwinbda5pweajdnb2hi4dthixs65ltmuys2mjoojswyylzfzuxe33ifzxgk5dxn5zgwlrpaiagdmakwcaiaayavqpzkpwyju --index 1
+
+cargo run -- run --bind-port 9946 --rpc-port 30335 --bootstrap-pubkey 78de748f77fb46c1eb7b255d8b7f636feea8d3cbb14f7665acc885db22f36ae9 --bootstrap-ip 172.31.149.62:9944 --ticket docaaacah55mbeqzr7h7354scrpybkhu2xlfvzxhiu2yakdvtkvzecbq7jjaf4n45epo75unqplpmsv3c37mnx65kgtzoyu65tfvteilwzc6nvosajdnb2hi4dthixs65ltmuys2mjoojswyylzfzuxe33ifzxgk5dxn5zgwlrpaiagdmakwcwn4ayavqpzkpwyju --index 2
 
 ### hint gossip
 
-./grpcurl -plaintext -proto ideal/beacon/src/hello.proto -d '{"index": 1, "size": 3}' '127.0.0.1:30333' hello.World/Hello
+In practice this would be done in an automated way, but for the sake of demonstration we'll do it all manually.
+
+We need to "load" the hints into a node's storage so we can get encryption keys. 
+
+#### save the preprocess output to a text file
+
+grpcurl -plaintext -proto src/hello.proto -d '{ }' '127.0.0.1:30333' hello.World/Preprocess > preprocess.txt
+
+#### save a partial decryption to a text file 
+
+grpcurl -plaintext -proto src/hello.proto -d '{ "ciphertext_hex": "2115b09e512c74b939564790da298ee893c356ffd82ede3190bcbebd53e51d910fbf670ea21a2aa2a95a0ded1b83c408bb170693f7341c1a48a194a9f0e56b8028fafc4658e1f1e51b49e6c3582b3b8b878ce999886a9d11a8bcc10ef89b326ad360b10918fc3565b4eede67b82e05f1a9bf64248d3286dc46d4f0492aa9e05324f104c4f1eb08aba3d5f8b53455cd72db96b832f407347f2e19ca5c91cad5eda2fda33351397764f1acbb034a1f2c30b9df0901161abe2cadbbe9e72c80faff65ea8bf78042935073f0e3949683e8621279da7fccb20f310c88ee56e8f4a0a263caa6c11d9fe5eab9e280f55724a86c29e30dd380033999b44b33308bed723e050156149ffe80363eb2068068d1d11104fad177070ae15230c25c759908e9f41ef38af0cd93dcebeb7b9f1df0c2a3b011b747bf572144905e0968a9c803f0ad2e50115b9d24e25d6b397b080b22f0270ed106356f17aaeb3965ad492d12de05ff80090e1a2099b3d19ee191f9d9b57013821849433f7b13b0cd1f45eaa8c27dba0a8b20fdf2e0d411835e377bd40ae680afd71a298baaccc556d6ce856bc7edf30a5da0d2e74416589d74631f5ff7bbe0c819439d81eaaac3e0819a62d1d29b0689c1e61da27eaf3afd6e75b5cc422c6f40101eeba590449be53f893d4d2c01a07aaecf01a13ab7fbddaa606b40573d6f47cbb4f198fe1043be457e816c5c4976c2b560f7369e9896b0ea5177df9b0e1c2d15f327e34bc2e1ec3e96d67420198fd33da0fef2d294aa75ff1277c3823a71a8b440dc7ecb66f008e8dbbbe1835282a18ef4c8227f245fefdd4672960a9960d6cd21a56fdc1c22326ffccd49ab8ca3b6e268e3ce744b8ede657271acc2ca1a860ca7832c5e803b792318e5393d9516e856f58f48201a422e8d5f9b70a493487a561817ef2be7950f3a5fb6b8e02c322593c4cb8852908c9ce902cbef7d6fb31870dea832cfa71414efbe09632997ca3929a7f8d65c3e7911cd3484ca28042e2202b8463c5d13104cf63bca78c25f353a8fab2e1e502e5428792d390637d55d8569f9f37e7cbe34ee2e255503081a5cb914c008f93e07bde39a12d7b029f0f396f37955abd1615852e509b41e63c05546dec7303905fd585195c4b328a5884416d09190f25d3af842f1ba9bf7721b793405d7cb67ba6e79d0ca8391b48d9f20f4f5c9ef2e6f4390a8a506e7b74c76bb132f99d604623897b3d6b6d0a053f0170fe72f85a14191ca5200217bd60608daf4b80475dafc3ed0b1b49f92137b962506fbe311e76b9685c98901b1e5cef24696381e61eddf11c97c0f0befe71a6736a18d5badd3241fc592322e3464fca5ce16940ea76330981744118e6d92ea2a6567d89b63fb81acd86230ddbac360b8d8ba35a8eff35e7cdbd7f161e1242cf98415102d537d00a67f620ff38d982268718c8140eeced16149047d362ac174421913bde5a8a08a872c3da7fc04c39ddfea0ffcee18bc53617aef88ba5813d303631d3bf6fee8ab7c5086b45a6ecaae2776c997368ad015e15e60ead1b78dc88d7d0955de512ead150edfcc4b183dadc5e9250d35c798a7f9709e864b520694ca74505856da3688346baefd3af011bf4dba0398861130ea70295ff6dfe2760ac3637f22162c80c4adc5e4235f0cb4a91c3f9f2061fbffce235aaebae8abcfe88f4919db8e3f2fc3d45f062f3605dabe9c1f398f6e9bfdb50e060e753e4579eb3cdf533ea730bd62f0deb846a8c3d9260a4e061c228b3859d84c6a1cb60853ba9fe960f97dbfb5f5276febda918bf1937fb45736f4596d63298c1db0eb2c8292148f069842f3caa6410757c6a50f258d851c58fbf7b444d0697430e915ad52a3681bbd6c57cb49c494d39ad6938c92b8ca380e0b000000000000006cbe12486cff4df5ca6ad65389e7ab749e87a51c3e79095fb32f8937" }' '127.0.0.1:30333' hello.World/Partdec > part_dec_0.txt

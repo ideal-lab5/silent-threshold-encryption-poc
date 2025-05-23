@@ -3,14 +3,20 @@ syntax = "proto3";
 package hello;
 
 service World {
-  rpc Hello (HelloRequest) returns (HelloReply);
+  rpc Preprocess (PreprocessRequest) returns (PreprocessResponse);
+  rpc Partdec (PartDecRequest) returns (PartDecResponse);
 }
 
-message HelloRequest {
-  uint32 index = 1;
-  uint32 size = 2;
+message PreprocessRequest { }
+
+message PreprocessResponse {
+  string hex_serialized_aggregate_key = 1;
 }
 
-message HelloReply {
-  string message = 1;
+message PartDecRequest {
+  string ciphertext_hex = 1;
+}
+
+message PartDecResponse {
+  string hex_serialized_decryption = 1;
 }

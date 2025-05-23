@@ -1,16 +1,23 @@
 use anyhow::Result;
 use iroh::{
-    endpoint::Connection,
     protocol::{ProtocolHandler, Router},
     Endpoint, NodeAddr, NodeId, SecretKey as IrohSecretKey,
+};
+use iroh_blobs::{net_protocol::Blobs, ALPN as BLOBS_ALPN};
+use iroh_docs::{
+    protocol::Docs,
+    rpc::client::docs::{Client, Doc, ShareMode},
+    ALPN as DOCS_ALPN,
 };
 use iroh_gossip::{
     net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender, GossipTopic},
     proto::TopicId,
     ALPN as GOSSIP_ALPN,
 };
+
 use n0_future::{task, StreamExt};
 
+use crate::types::*;
 use ark_ec::pairing::Pairing;
 use ark_poly::univariate::DensePolynomial;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -26,38 +33,62 @@ use std::{
     fmt,
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
+    sync::Arc,
 };
+use tokio::sync::Mutex;
 
-use crate::types::*;
 use codec::{Decode, Encode};
-// use crate::rpc::*;
+use quic_rpc::transport::flume::FlumeConnector;
 
+pub(crate) type BlobsClient = iroh_blobs::rpc::client::blobs::Client<
+    FlumeConnector<iroh_blobs::rpc::proto::Response, iroh_blobs::rpc::proto::Request>,
+>;
+pub(crate) type DocsClient = iroh_docs::rpc::client::docs::Client<
+    FlumeConnector<iroh_docs::rpc::proto::Response, iroh_docs::rpc::proto::Request>,
+>;
+pub(crate) type GossipClient = iroh_gossip::rpc::client::Client<
+    FlumeConnector<iroh_gossip::rpc::proto::Response, iroh_gossip::rpc::proto::Request>,
+>;
+
+/// A node...
+#[derive(Debug, Clone)]
 pub struct Node<C: Pairing> {
     /// the iroh endpoint
     endpoint: Endpoint,
     /// the iroh router
     router: Router,
+    /// blobs client
+    blobs: BlobsClient,
+    /// docs client
+    docs: DocsClient,
     /// the iroh-gossip communication layer
-    gossip: Gossip,
-    /// the gossip sneder
-    // gossip_sender: GossipSender,
-    // gossip_receiver: GossipReceiver,
+    gossip: GossipClient,
+    /// the secret key the node uses to sign messages
     iroh_secret_key: IrohSecretKey,
     /// the bls secret key
     secret_key: SecretKey<C>,
-    /// the lagrange params
-    lagrange_params: LagrangePowers<C>,
-    // known_hints: Option<Vec<u8>>,
+    /// the node state
+    state: Arc<Mutex<State<C>>>,
 }
 
-use crate::{MyWorld, WorldServer};
-use tonic::transport::Server;
+impl<C: Pairing> Node<C> {
+    pub fn blobs(&self) -> BlobsClient {
+        self.blobs.clone()
+    }
+
+    pub fn docs(&self) -> DocsClient {
+        self.docs.clone()
+    }
+}
 
 impl<C: Pairing> Node<C> {
     /// start the node
-    pub async fn build(params: StartNodeParams<C>) -> Self {
-        //  -> Result<Self> {
-        println!("Building the node... ");
+    pub async fn build(
+        params: StartNodeParams<C>, 
+        rx: flume::Receiver<Announcement>,
+        state: Arc<Mutex<State<C>>>,
+    ) -> Self {
+        println!("Building the node...");
         let endpoint = Endpoint::builder()
             .secret_key(params.iroh_secret_key.clone())
             .discovery_n0()
@@ -69,112 +100,45 @@ impl<C: Pairing> Node<C> {
 
         // build gossip protocol
         let gossip = Gossip::builder().spawn(endpoint.clone()).await.unwrap();
+        // build the blobs protocol (just in mem for now, not persistent)
+        let blobs = Blobs::memory().build(&endpoint.clone());
+        // build the docs protocol (just in mem for now, not persistent)
+        let docs = Docs::memory().spawn(&blobs, &gossip).await.unwrap();
         // setup router
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
+            .accept(BLOBS_ALPN, blobs.clone())
+            .accept(DOCS_ALPN, docs.clone())
             .spawn()
             .await
             .unwrap();
+
         let addr = router.endpoint().node_addr().await;
         println!("> Generated node address: {:?}", addr);
-        let lagrange_params = LagrangePowers::<C>::new(params.tau, params.kzg_size);
+
+        let arc_state_clone = Arc::clone(&state);
+
+        n0_future::task::spawn(async move {
+            while let Ok(announcement) = rx.recv_async().await {
+                let mut state = arc_state_clone.lock().await;
+                state.update(announcement);
+            }
+        });
 
         Node {
             endpoint,
             router,
             iroh_secret_key: params.iroh_secret_key,
             secret_key: params.secret_key,
-            gossip,
-            // gossip_sender: sender,
-            // gossip_receiver: receiver,
-            lagrange_params,
+            blobs: blobs.client().clone(),
+            docs: docs.client().clone(),
+            gossip: gossip.client().clone(),
+            state,
         }
-
-
-        // let (sender, mut receiver) = Self::try_connect_peers(
-        //     endpoint.clone(),
-        //     gossip.clone(),
-        //     params.topic,
-        //     params.bootstrap_peers.clone(),
-        // )
-        // .await
-        // .unwrap()
-        // .split();
-
-        // // start the RPC server
-        // // n0_future::task::spawn(async move {
-        //     let addr_str = format!("127.0.0.1:{}", params.rpc_port);
-        //     let addr = addr_str.parse().unwrap();
-        //     let world = MyWorld(node);
-        //     println!("> Server listening on {}", addr);
-        //     Server::builder()
-        //         .add_service(WorldServer::new(world))
-        //         .serve(addr)
-        //         .await
-        //         .unwrap();
-        // // });
-        // println!("asdfasdf");
-        // loop {
-        //     while let Ok(Some(event)) = receiver.try_next().await {
-        //         if let Event::Gossip(GossipEvent::Received(msg)) = event {
-        //             let announcement =
-        //                 Announcement::decode(&mut msg.content.to_vec().as_slice()).unwrap();
-        //             match announcement.tag {
-        //                 Tag::Hint => {
-        //                     let pk = PublicKey::<E>::deserialize_compressed(&announcement.data[..])
-        //                         .unwrap();
-        //                 }
-        //                 _ => {
-        //                     todo!();
-        //                 }
-        //             }
-        //             println!("RECEIVED MESSAGE {:?}", announcement);
-        //         }
-        //     }
-        // }
-        // node.listen().await;
     }
 
-    // // start the RPC server
-    // n0_future::task::spawn(async move {
-    //     let addr_str = format!("127.0.0.1:{}", params.rpc_port);
-    //     let addr = addr_str.parse().unwrap();
-    //     let world = MyWorld(node);
-    //     println!("> Server listening on {}", addr);
-    //     Server::builder()
-    //         .add_service(WorldServer::new(world))
-    //         .serve(addr)
-    //         .await
-    //         .unwrap();
-    // });
-    // subscribe and print loop
-    // pub async fn listen(&mut self) {
-    //     loop {
-    //         while let Ok(Some(event)) = self.gossip_receiver.try_next().await {
-    //             if let Event::Gossip(GossipEvent::Received(msg)) = event {
-    //                 let announcement =
-    //                     Announcement::decode(&mut msg.content.to_vec().as_slice()).unwrap();
-    //                 match announcement.tag {
-    //                     Tag::Hint => {
-    //                         let pk = PublicKey::<E>::deserialize_compressed(&announcement.data[..])
-    //                             .unwrap();
-    //                     }
-    //                     _ => {
-    //                         todo!();
-    //                     }
-    //                 }
-    //                 println!("RECEIVED MESSAGE {:?}", announcement);
-    //             }
-    //         }
-    //     }
-    // }
-
     /// join the gossip topic by connecting to known peers, if any
-    pub async fn try_connect_peers(
-        &mut self,
-        topic: TopicId,
-        peers: Option<Vec<NodeAddr>>,
-    ) -> Result<GossipTopic> {
+    pub async fn try_connect_peers(&mut self, peers: Option<Vec<NodeAddr>>) -> Result<()> {
         let mut bootstrap_node_pubkeys = Vec::new();
         match peers {
             Some(bootstrap) => {
@@ -191,31 +155,20 @@ impl<C: Pairing> Node<C> {
             }
         };
 
-        let gossipsub_topic = self.gossip
-            .subscribe_and_join(topic, bootstrap_node_pubkeys)
-            .await?;
-
         println!("> Connection established.");
-
-        Ok(gossipsub_topic)
-    }
-
-    pub(crate) fn lagrange_get_pk(&self, i: usize, size: usize) -> PublicKey<C> {
-        self.secret_key
-            .lagrange_get_pk(i, &self.lagrange_params, size)
-    }
-
-    pub(crate) async fn broadcast(&self, msg: bytes::Bytes) {
-        println!(":adsfadfasdf");
-        // self.gossip_sender.broadcast(msg).await.unwrap();
-    }
-
-    pub async fn addr(&self) -> Result<NodeAddr> {
-        self.router.endpoint().node_addr().await
-    }
-
-    pub async fn shutdown(&mut self) -> Result<()> {
-        self.router.shutdown().await?;
         Ok(())
+    }
+
+    pub async fn lagrange_get_pk(&self, i: usize, size: usize) -> Option<PublicKey<C>> {
+        if let Some(cfg) = &self.state.lock().await.config {
+            let size = cfg.size;
+            let lagrange_params = LagrangePowers::<C>::new(cfg.tau, size);
+            return Some(
+                self.secret_key
+                    .lagrange_get_pk(i, &lagrange_params, size),
+            );
+        }
+
+        None
     }
 }
