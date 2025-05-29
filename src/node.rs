@@ -1,21 +1,12 @@
 use anyhow::Result;
-use iroh::{
-    protocol::Router,
-    Endpoint, NodeAddr,
-};
+use iroh::{protocol::Router, Endpoint, NodeAddr};
 use iroh_blobs::{net_protocol::Blobs, ALPN as BLOBS_ALPN};
-use iroh_docs::{
-    protocol::Docs,
-    ALPN as DOCS_ALPN,
-};
-use iroh_gossip::{
-    net::Gossip,
-    ALPN as GOSSIP_ALPN,
-};
+use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
+use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
 
 use crate::types::*;
 use ark_ec::pairing::Pairing;
-use silent_threshold_encryption::setup::{PublicKey, SecretKey};
+use silent_threshold_encryption::setup::PublicKey;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
@@ -30,18 +21,27 @@ pub(crate) type BlobsClient = iroh_blobs::rpc::client::blobs::Client<
 pub(crate) type DocsClient = iroh_docs::rpc::client::docs::Client<
     FlumeConnector<iroh_docs::rpc::proto::Response, iroh_docs::rpc::proto::Request>,
 >;
+pub(crate) type GossipClient = iroh_gossip::rpc::client::Client<
+    FlumeConnector<iroh_gossip::rpc::proto::Response, iroh_gossip::rpc::proto::Request>,
+>;
 
 /// A node...
 #[derive(Clone)]
 pub struct Node<C: Pairing> {
     /// the iroh endpoint
     endpoint: Endpoint,
+    /// the iroh router
+    router : Router,
     /// blobs client
     blobs: BlobsClient,
     /// docs client
     docs: DocsClient,
-    /// the bls secret key
-    secret_key: SecretKey<C>,
+    /// the iroh-gossip protocol
+    gossip: GossipClient,
+    // / the secret key the node uses to sign messages
+    // iroh_secret_key: IrohSecretKey,
+    // / the bls secret key
+    // secret_key: SecretKey<C>,
     /// the node state
     state: Arc<Mutex<State<C>>>,
 }
@@ -102,9 +102,10 @@ impl<C: Pairing> Node<C> {
 
         Node {
             endpoint,
-            secret_key: params.secret_key,
+            router,
             blobs: blobs.client().clone(),
-            docs: docs.client().clone(), 
+            docs: docs.client().clone(),
+            gossip: gossip.client().clone(),
             state,
         }
     }
@@ -129,8 +130,9 @@ impl<C: Pairing> Node<C> {
     }
 
     pub async fn get_pk(&self) -> Option<PublicKey<C>> {
-        if let Some(cfg) = &self.state.lock().await.config {
-            return Some(self.secret_key.get_pk(&cfg.crs));
+        let state = &self.state.lock().await;
+        if let (Some(cfg), sk) = (state.config.clone(), state.sk.clone()) {
+            return Some(sk.get_pk(&cfg.crs));
         }
 
         None

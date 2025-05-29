@@ -1,7 +1,5 @@
 use anyhow::Result;
-use iroh::{
-    SecretKey as IrohSecretKey,
-};
+use iroh::SecretKey as IrohSecretKey;
 
 use ark_ec::pairing::Pairing;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -40,10 +38,7 @@ pub struct StartNodeParams<C: Pairing> {
 
 /// params to start a new node
 impl<C: Pairing> StartNodeParams<C> {
-    pub fn rand(
-        bind_port: u16,
-        index: usize,
-    ) -> Self {
+    pub fn rand(bind_port: u16, index: usize) -> Self {
         Self {
             iroh_secret_key: IrohSecretKey::generate(OsRng),
             secret_key: SecretKey::<C>::new(&mut OsRng, index),
