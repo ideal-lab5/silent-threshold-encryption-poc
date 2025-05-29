@@ -1,8 +1,7 @@
 use anyhow::Result;
 use ark_ec::pairing::Pairing;
-use ark_poly::univariate::DensePolynomial;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::{UniformRand, Zero};
+use ark_std::{rand::rngs::OsRng, UniformRand};
 use clap::{Parser, Subcommand};
 use codec::{Decode, Encode};
 use core::net::SocketAddr;
@@ -26,7 +25,7 @@ use silent_threshold_encryption::{
     aggregate::SystemPublicKeys,
     decryption::agg_dec,
     encryption::encrypt,
-    setup::{LagPolys, PartialDecryption, PublicKey, SecretKey},
+    setup::PartialDecryption,
     types::Ciphertext,
 };
 use std::io::prelude::*;
@@ -42,15 +41,6 @@ mod types;
 use crate::node::*;
 use crate::rpc::*;
 use crate::types::*;
-
-use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Key, Nonce,
-};
-type E = ark_bls12_381::Bls12_381;
-type G2 = <E as Pairing>::G2;
-type Fr = <E as Pairing>::ScalarField;
-type UniPoly381 = DensePolynomial<<E as Pairing>::ScalarField>;
 
 // https://hackmd.io/3968Gr5hSSmef-nptg2GRw
 // https://hackmd.io/xqYBrigYQwyKM_0Sn5Xf4w
@@ -68,9 +58,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Setup {
-        /// The kzg commitment size
-        #[arg(long)]
-        size: usize,
         /// The output directory (relative path)
         #[arg(long)]
         out_dir: String,
@@ -117,7 +104,7 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
 
     match &args.command {
-        Some(Commands::Setup { size, out_dir }) => {
+        Some(Commands::Setup { out_dir: _ }) => {
             // TODO: keygen
             println!("> Nothing happened");
         }
@@ -162,7 +149,7 @@ async fn main() -> Result<()> {
                 .open("ciphertext.txt")
                 .unwrap();
 
-            let _ = write!(&mut file, "{}", hex::encode(ciphertext_bytes)).unwrap();
+            write!(&mut file, "{}", hex::encode(ciphertext_bytes)).unwrap();
             println!("> saved ciphertext to disk");
         }
         Some(Commands::Decrypt {
@@ -210,7 +197,7 @@ async fn main() -> Result<()> {
 
             let part_dec_0 =
                 PartialDecryption::<E>::deserialize_compressed(&part_dec_0_bytes[..]).unwrap();
-            partial_decryptions[0] = (part_dec_0);
+            partial_decryptions[0] = part_dec_0;
 
             // get a second one
             // let mut client = WorldClient::connect("http://127.0.0.1:30334")
@@ -263,11 +250,11 @@ async fn main() -> Result<()> {
             let mut bootstrap_addrs: Vec<NodeAddr> = Vec::new();
             if let Some(pubkey) = bootstrap_pubkey {
                 if let Some(ip) = bootstrap_ip {
-                    let pubkey = IrohPublicKey::from_str(&pubkey).unwrap();
+                    let pubkey = IrohPublicKey::from_str(pubkey).unwrap();
                     let socket: SocketAddr = ip.parse().unwrap();
                     bootstrap_addrs.push(NodeAddr::from((pubkey, None, vec![socket].as_slice())));
 
-                    if bootstrap_addrs.len() > 0 {
+                    if !bootstrap_addrs.is_empty() {
                         bootstrap = Some(bootstrap_addrs);
                     }
                 }
@@ -276,14 +263,14 @@ async fn main() -> Result<()> {
             // a channel for sending and receiving doc announcements
             let (tx, rx) = flume::unbounded();
             let params =
-                StartNodeParams::<E>::rand(*bind_port, *rpc_port, index.clone(), bootstrap.clone());
+                StartNodeParams::<E>::rand(*bind_port, *index);
             // let sk = params.secret_key.clone();
             // let mut test = Vec::new();
             // sk.serialize_compressed(&mut test).unwrap();
             // panic!("{:?}", test);
 
             // a state for storing config and hints
-            let mut state = State::<E>::empty(params.secret_key.clone());
+            let state = State::<E>::empty(params.secret_key.clone());
             let arc_state = Arc::new(Mutex::new(state.clone()));
             let arc_state_clone = Arc::clone(&arc_state.clone());
             // build the node
@@ -306,7 +293,7 @@ async fn main() -> Result<()> {
                     .await
                     .unwrap();
 
-                println!("Entry ticket: {}", ticket.to_string());
+                println!("Entry ticket: {}", ticket);
 
                 // load the doc
                 let doc_stream = node.docs().import(ticket.clone()).await.unwrap();
@@ -325,7 +312,7 @@ async fn main() -> Result<()> {
                     .unwrap();
                 doc_stream
             } else {
-                let ticket = DocTicket::from_str(&ticket).unwrap();
+                let ticket = DocTicket::from_str(ticket).unwrap();
                 // load the doc
                 node.docs().import(ticket.clone()).await.unwrap()
             };
@@ -342,7 +329,7 @@ async fn main() -> Result<()> {
             let cfg_entry = doc_stream.get_many(config_query.build()).await.unwrap();
             let config = cfg_entry.collect::<Vec<_>>().await;
             let hash = config[0].as_ref().unwrap().content_hash();
-            let mut content = node.blobs().read_to_bytes(hash).await.unwrap();
+            let content = node.blobs().read_to_bytes(hash).await.unwrap();
             // try to decode an announcement (config accouncement)
             let a = Announcement::decode(&mut content.slice(..).to_vec().as_slice()).unwrap();
             // send it
@@ -359,7 +346,7 @@ async fn main() -> Result<()> {
                     let entry_list = doc_stream.get_many(hint_query.build()).await.unwrap();
                     let entry = entry_list.collect::<Vec<_>>().await;
                     let hash = entry[0].as_ref().unwrap().content_hash();
-                    let mut content = node.blobs().read_to_bytes(hash).await.unwrap();
+                    let content = node.blobs().read_to_bytes(hash).await.unwrap();
                     let announcement =
                         Announcement::decode(&mut content.slice(..).to_vec().as_slice()).unwrap();
                     tx.send(announcement).unwrap();
@@ -433,7 +420,7 @@ async fn run_state_sync<C: Pairing>(
     while let Ok(event) = sub.try_next().await {
         if let Some(evt) = event {
             println!("{:?}", evt);
-            if let LiveEvent::InsertRemote { from, entry, .. } = evt {
+            if let LiveEvent::InsertRemote {  entry, .. } = evt {
                 let msg_body = blobs.read_to_bytes(entry.content_hash()).await;
                 match msg_body {
                     Ok(msg) => {
@@ -471,7 +458,7 @@ fn setup(size: usize) -> Vec<u8> {
         .truncate(true)
         .open("config.txt")
         .unwrap();
-    let _ = write!(&mut file, "{}", hex::encode(bytes.clone())).unwrap();
+    write!(&mut file, "{}", hex::encode(bytes.clone())).unwrap();
     println!("> saved to disk");
     bytes
 }

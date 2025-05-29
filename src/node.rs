@@ -1,42 +1,27 @@
 use anyhow::Result;
 use iroh::{
-    protocol::{ProtocolHandler, Router},
-    Endpoint, NodeAddr, NodeId, SecretKey as IrohSecretKey,
+    protocol::Router,
+    Endpoint, NodeAddr,
 };
 use iroh_blobs::{net_protocol::Blobs, ALPN as BLOBS_ALPN};
 use iroh_docs::{
     protocol::Docs,
-    rpc::client::docs::{Client, Doc, ShareMode},
     ALPN as DOCS_ALPN,
 };
 use iroh_gossip::{
-    net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender, GossipTopic},
-    proto::TopicId,
+    net::Gossip,
     ALPN as GOSSIP_ALPN,
 };
 
-use n0_future::{task, StreamExt};
-
 use crate::types::*;
 use ark_ec::pairing::Pairing;
-use ark_poly::univariate::DensePolynomial;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::{rand::rngs::OsRng, UniformRand, Zero};
-use silent_threshold_encryption::{
-    decryption::agg_dec,
-    encryption::encrypt,
-    setup::{PublicKey, SecretKey},
-};
+use silent_threshold_encryption::setup::{PublicKey, SecretKey};
 use std::{
-    collections::HashMap,
-    fmt,
     net::{Ipv4Addr, SocketAddrV4},
-    str::FromStr,
     sync::Arc,
 };
 use tokio::sync::Mutex;
 
-use codec::{Decode, Encode};
 use quic_rpc::transport::flume::FlumeConnector;
 
 pub(crate) type BlobsClient = iroh_blobs::rpc::client::blobs::Client<
@@ -45,25 +30,16 @@ pub(crate) type BlobsClient = iroh_blobs::rpc::client::blobs::Client<
 pub(crate) type DocsClient = iroh_docs::rpc::client::docs::Client<
     FlumeConnector<iroh_docs::rpc::proto::Response, iroh_docs::rpc::proto::Request>,
 >;
-pub(crate) type GossipClient = iroh_gossip::rpc::client::Client<
-    FlumeConnector<iroh_gossip::rpc::proto::Response, iroh_gossip::rpc::proto::Request>,
->;
 
 /// A node...
 #[derive(Clone)]
 pub struct Node<C: Pairing> {
     /// the iroh endpoint
     endpoint: Endpoint,
-    /// the iroh router
-    router: Router,
     /// blobs client
     blobs: BlobsClient,
     /// docs client
     docs: DocsClient,
-    /// the iroh-gossip protocol
-    gossip: GossipClient,
-    /// the secret key the node uses to sign messages
-    iroh_secret_key: IrohSecretKey,
     /// the bls secret key
     secret_key: SecretKey<C>,
     /// the node state
@@ -126,28 +102,22 @@ impl<C: Pairing> Node<C> {
 
         Node {
             endpoint,
-            router,
-            iroh_secret_key: params.iroh_secret_key,
             secret_key: params.secret_key,
             blobs: blobs.client().clone(),
-            docs: docs.client().clone(),
-            gossip: gossip.client().clone(),
+            docs: docs.client().clone(), 
             state,
         }
     }
 
     /// join the gossip topic by connecting to known peers, if any
     pub async fn try_connect_peers(&mut self, peers: Option<Vec<NodeAddr>>) -> Result<()> {
-        let mut bootstrap_node_pubkeys = Vec::new();
         match peers {
             Some(bootstrap) => {
-                let peer_ids: Vec<NodeId> = bootstrap.iter().map(|p| p.node_id).collect();
                 println!("> trying to connect to {} peer(s)", bootstrap.len());
                 // add the peer addrs to our endpoint's addressbook so that they can be dialed
                 for peer in bootstrap.into_iter() {
                     self.endpoint.add_node_addr(peer)?;
                 }
-                bootstrap_node_pubkeys = peer_ids;
             }
             None => {
                 // do nothing
