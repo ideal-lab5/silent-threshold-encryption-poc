@@ -10,7 +10,8 @@ iroh = { version = "0.34.1", default-features = false, features = [
 ] }
 iroh-gossip = {version = "0.34.1", features = ["rpc"]}
 n0-future = "0.1.2"
-silent-threshold-encryption = { git = "https://github.com/guruvamsi-policharla/silent-threshold-encryption.git", default-features = false }
+# silent-threshold-encryption = { git = "https://github.com/guruvamsi-policharla/silent-threshold-encryption.git", default-features = false }
+silent-threshold-encryption = { path = "../silent-threshold-encryption", default-features = false}
 ark-std = "0.5.0"
 ark-ec = "0.5.0"
 ark-poly = "0.5.0"
@@ -39,6 +40,8 @@ iroh-blobs = "0.34.1"
 quic-rpc = "0.19.0"
 flume = "0.11.1"
 aes-gcm = "0.10.3"
+blake2 = "0.10.6"
+hkdf = "0.12.4"
 
 [build-dependencies]
 tonic-build = "0.13.0"

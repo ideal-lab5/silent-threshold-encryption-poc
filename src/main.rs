@@ -2,13 +2,15 @@ use anyhow::Result;
 use ark_ec::pairing::Pairing;
 use ark_poly::univariate::DensePolynomial;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::UniformRand;
+use ark_std::{UniformRand, Zero};
 use clap::{Parser, Subcommand};
 use codec::{Decode, Encode};
 use core::net::SocketAddr;
 use core::str::FromStr;
 use futures::prelude::*;
-use hello::{world_client::WorldClient, world_server::WorldServer, PartDecRequest};
+use hello::{
+    world_client::WorldClient, world_server::WorldServer, PartDecRequest, PreprocessRequest,
+};
 use iroh::{NodeAddr, PublicKey as IrohPublicKey};
 use iroh_docs::{
     engine::LiveEvent,
@@ -21,10 +23,11 @@ use iroh_docs::{
 };
 use quic_rpc::transport::flume::FlumeConnector;
 use silent_threshold_encryption::{
+    aggregate::SystemPublicKeys,
     decryption::agg_dec,
     encryption::encrypt,
-    kzg::KZG10,
-    setup::{AggregateKey, LagrangePowers, PublicKey, SecretKey},
+    setup::{LagPolys, PartialDecryption, PublicKey, SecretKey},
+    types::Ciphertext,
 };
 use std::io::prelude::*;
 use std::sync::Arc;
@@ -52,9 +55,7 @@ type UniPoly381 = DensePolynomial<<E as Pairing>::ScalarField>;
 // https://hackmd.io/3968Gr5hSSmef-nptg2GRw
 // https://hackmd.io/xqYBrigYQwyKM_0Sn5Xf4w
 // https://eprint.iacr.org/2024/263.pdf
-
-// hardcoded and arbitrary for now...
-const MAX_COMMITTEE_SIZE: usize = 12;
+const MAX_COMMITTEE_SIZE: usize = 2;
 
 #[derive(Parser, Debug)]
 #[command(name = "STE", version = "1.0")]
@@ -101,11 +102,11 @@ enum Commands {
         #[arg(long)]
         message: String,
         #[arg(long)]
-        preprocess_dir: String,
-        #[arg(long)]
-        kzg_params_dir: String,
+        config_dir: String,
     },
     Decrypt {
+        #[arg(long)]
+        config_dir: String,
         #[arg(long)]
         ciphertext_dir: String,
     },
@@ -122,42 +123,37 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Encrypt {
             message,
-            preprocess_dir,
-            kzg_params_dir,
+            config_dir,
         }) => {
-            println!("> (1/2) Running encryption using AES_GCM");
-            // keygen
-            let key = Aes256Gcm::generate_key(OsRng);
-            // encryption
-            let cipher = Aes256Gcm::new(&key);
-            // 96-bits, unique per message
-            let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-            let ciphertext: Vec<u8> = cipher.encrypt(&nonce, message.as_bytes()).unwrap();
+            let config_hex =
+                fs::read_to_string(config_dir).expect("you must provide a valid config file.");
+            let config_bytes = hex::decode(&config_hex).unwrap();
+            let config = Config::<E>::deserialize_compressed(&config_bytes[..]).unwrap();
 
-            println!("> (2/2) Running threshold encryption");
-            // read aggregate key from preprocess_dir (no hex - should make consistent...)
-            let aggr_hex = fs::read_to_string(preprocess_dir)
-                .expect("you must provide a valid encryption key.");
-            let aggr_bytes = hex::decode(&aggr_hex[2..]).unwrap();
-            let aggr = AggregateKey::<E>::deserialize_compressed(&aggr_bytes[..]).unwrap();
-            // // read kzg params from a file (hex encoded)
-            let kzg_hex = fs::read_to_string(kzg_params_dir)
-                .expect("you must provide a valid kzg params file.");
-            let kzg_bytes = hex::decode(&kzg_hex[2..]).unwrap();
-            let config = Config::<E>::deserialize_compressed(&kzg_bytes[..]).unwrap();
-
-            let kzg_params = KZG10::<E, UniPoly381>::setup(config.size, config.tau).unwrap();
-            // encryption
-            let key_ciphertext = encrypt::<E>(&aggr, MAX_COMMITTEE_SIZE - 1, &kzg_params);
-            let mut ciphertext_bytes = Vec::new();
-            key_ciphertext
-                .serialize_compressed(&mut ciphertext_bytes)
+            // get the sys key
+            let sys_key_request = tonic::Request::new(PreprocessRequest {});
+            // from first node
+            let mut client = WorldClient::connect("http://127.0.0.1:30333")
+                .await
                 .unwrap();
+            let response = client.preprocess(sys_key_request).await.unwrap();
+            let hex = response.into_inner().hex_serialized_sys_key;
+            let bytes = hex::decode(&hex[..]).unwrap();
 
-            let bundle = CiphertextBundle {
-                message_ciphertext: ciphertext,
-                key_ciphertext: ciphertext_bytes,
-            };
+            let sys_keys = SystemPublicKeys::<E>::deserialize_compressed(&bytes[..]).unwrap();
+            let subset = vec![0, 1];
+            let (_ak, ek) = sys_keys.get_aggregate_key(&subset, &config.crs, &config.lag_polys);
+            // let mut test = Vec::new();
+            // ek.serialize_compressed(&mut test).unwrap();
+            // panic!("{:?}", test);
+            // t = 1 , n = MAX, k = 1
+            let t = 1;
+            let gamma_g2 = G2::rand(&mut OsRng);
+            let ct = encrypt::<E>(&ek, t, &config.crs, gamma_g2, message.as_bytes());
+            let mut ciphertext_bytes = Vec::new();
+            ct.serialize_compressed(&mut ciphertext_bytes).unwrap();
+
+            // panic!("{:?}", ciphertext_bytes);
 
             let mut file = OpenOptions::new()
                 .create(true)
@@ -166,39 +162,92 @@ async fn main() -> Result<()> {
                 .open("ciphertext.txt")
                 .unwrap();
 
-            let _ = write!(&mut file, "0x{}", hex::encode(bundle.encode())).unwrap();
+            let _ = write!(&mut file, "{}", hex::encode(ciphertext_bytes)).unwrap();
             println!("> saved ciphertext to disk");
         }
-        Some(Commands::Decrypt { ciphertext_dir }) => {
-            let mut partial_decryptions = Vec::new();
+        Some(Commands::Decrypt {
+            config_dir,
+            ciphertext_dir,
+        }) => {
+            // read the config
+            let config_hex =
+                fs::read_to_string(config_dir).expect("you must provide a valid config file.");
+            let config_bytes = hex::decode(&config_hex).unwrap();
+            let config = Config::<E>::deserialize_compressed(&config_bytes[..]).unwrap();
+            // get the ciphertext
+            let ciphertext_hex =
+                fs::read_to_string(ciphertext_dir).expect("you must provide a ciphertext.");
+            let ciphertext_bytes = hex::decode(ciphertext_hex.clone()).unwrap();
+            let ciphertext =
+                Ciphertext::<E>::deserialize_compressed(&ciphertext_bytes[..]).unwrap();
 
-            // read aggregate key from preprocess_dir
-            let ciphertext_hex = fs::read_to_string(ciphertext_dir)
-                .expect("you must provide a valid encryption key.");
-            // then get partial decryptions for the key_ct (hardcoded for now)
-            let request = tonic::Request::new(PartDecRequest { ciphertext_hex });
+            // get the sys key
+            let sys_key_request = tonic::Request::new(PreprocessRequest {});
+            // from first node
             let mut client = WorldClient::connect("http://127.0.0.1:30333")
                 .await
                 .unwrap();
-            let response = client.partdec(request).await.unwrap();
-            let part_dec_0 = response.into_inner().hex_serialized_decryption
-            partial_decryptions.push(part_dec_0);
+            let response = client.preprocess(sys_key_request).await.unwrap();
+            let hex = response.into_inner().hex_serialized_sys_key;
+            let bytes = hex::decode(&hex[..]).unwrap();
+            let sys_keys = SystemPublicKeys::<E>::deserialize_compressed(&bytes[..]).unwrap();
+            // hardcoded to be just the first sig
+            let subset = vec![0, 1];
+            let (ak, _ek) = sys_keys.get_aggregate_key(&subset, &config.crs, &config.lag_polys);
+            
+            // get a partial decryption
+            let request = tonic::Request::new(PartDecRequest {
+                ciphertext_hex: ciphertext_hex.clone(),
+            });
 
-            // get a part dec from the second node
-            let mut client = WorldClient::connect("http://127.0.0.1:30334")
-                .await
-                .unwrap();
-            let response = client.partdec(request).await.unwrap();
-            let part_dec_1 = response.into_inner().hex_serialized_decryption
-            partial_decryptions.push(part_dec_1);
-            println!("> Collected enough partial decryptions, attempting to decrypt the ciphertext");
+            let mut partial_decryptions = vec![PartialDecryption::zero(); MAX_COMMITTEE_SIZE];
 
-            // extract the key ciphertext
-            // get the kzg params
-            // get the selector
-            // then combine and decrypt!
-            let dec_key = agg_dec(&partial_decryptions, &ct, &selector, &agg_key, &kzg_params);
-            // then use it to recover the plaintext (AES GCM decryption)
+            let response = client.partdec(request).await.unwrap();
+            let part_dec_0_hex = response.into_inner().hex_serialized_decryption;
+            let part_dec_0_bytes = hex::decode(&part_dec_0_hex[..]).unwrap();
+
+            // panic!("{:?}", part_dec_0_bytes);
+
+            let part_dec_0 =
+                PartialDecryption::<E>::deserialize_compressed(&part_dec_0_bytes[..]).unwrap();
+            partial_decryptions[0] = (part_dec_0);
+
+            // get a second one
+            // let mut client = WorldClient::connect("http://127.0.0.1:30334")
+            //     .await
+            //     .unwrap();
+            // let request = tonic::Request::new(PartDecRequest { ciphertext_hex });
+            // let response = client.partdec(request).await.unwrap();
+            // let part_dec_1_hex = response.into_inner().hex_serialized_decryption;
+            // let part_dec_1_bytes = hex::decode(&part_dec_1_hex[..]).unwrap();
+            // let part_dec_1 =
+            //     PartialDecryption::<E>::deserialize_compressed(&part_dec_1_bytes[..]).unwrap();
+            // partial_decryptions.push(part_dec_1);
+
+            println!("> Collected partial decryptions, attempting to decrypt the ciphertext");
+
+            let mut selector = vec![false; MAX_COMMITTEE_SIZE];
+            selector[0] = true;
+
+            let mut pds = Vec::new();
+	        partial_decryptions.iter().for_each(|pd| {
+                let mut test = Vec::new();
+                pd.serialize_compressed(&mut test).unwrap();
+                pds.push(test);
+            });
+
+            let mut ct_bytes = Vec::new();
+            ciphertext.serialize_compressed(&mut ct_bytes).unwrap();
+
+            // selector[1] = true;
+            let out = agg_dec(
+                &partial_decryptions,
+                &ciphertext,
+                &selector,
+                &ak,
+                &config.crs,
+            );
+            println!("OUT: {:?}", std::str::from_utf8(&out).unwrap());
         }
         Some(Commands::Run {
             bind_port,
@@ -228,9 +277,14 @@ async fn main() -> Result<()> {
             let (tx, rx) = flume::unbounded();
             let params =
                 StartNodeParams::<E>::rand(*bind_port, *rpc_port, index.clone(), bootstrap.clone());
+            // let sk = params.secret_key.clone();
+            // let mut test = Vec::new();
+            // sk.serialize_compressed(&mut test).unwrap();
+            // panic!("{:?}", test);
+
             // a state for storing config and hints
             let mut state = State::<E>::empty(params.secret_key.clone());
-            let arc_state = Arc::new(Mutex::new(state));
+            let arc_state = Arc::new(Mutex::new(state.clone()));
             let arc_state_clone = Arc::clone(&arc_state.clone());
             // build the node
             let mut node = Node::build(params, rx, arc_state).await;
@@ -240,8 +294,8 @@ async fn main() -> Result<()> {
             let doc_stream = if *is_bootstrap {
                 // if you are a bootstrap node then you must generate the kzg params
                 // and build the initial 'ticket'
-                println!("Initial Startup: Running KZG param generation");
-                let config_bytes: Vec<u8> = kzg_setup(MAX_COMMITTEE_SIZE);
+                println!("Initial Startup: Generating new config");
+                let config_bytes: Vec<u8> = setup(MAX_COMMITTEE_SIZE);
 
                 let doc = node.docs().create().await.unwrap();
                 let ticket = doc
@@ -251,21 +305,21 @@ async fn main() -> Result<()> {
                     )
                     .await
                     .unwrap();
+
                 println!("Entry ticket: {}", ticket.to_string());
+
                 // load the doc
                 let doc_stream = node.docs().import(ticket.clone()).await.unwrap();
 
-                let kzg_config_announcement = Announcement {
+                let config_announcement = Announcement {
                     tag: Tag::Config,
                     data: config_bytes,
                 };
-                // send yourself the config
-                // tx.send(kzg_config_announcement.clone()).unwrap();
                 let _ = doc_stream
                     .set_bytes(
                         node.docs().authors().default().await.unwrap(),
-                        KZG_CONFIG_KEY,
-                        kzg_config_announcement.encode(),
+                        CONFIG_KEY,
+                        config_announcement.encode(),
                     )
                     .await
                     .unwrap();
@@ -279,42 +333,44 @@ async fn main() -> Result<()> {
             // start the state sync loop
             n0_future::task::spawn(run_state_sync(doc_stream.clone(), node.clone(), tx.clone()));
             // wait a few secs for the doc to sync
-            thread::sleep(Duration::from_secs(3));
+            thread::sleep(Duration::from_secs(2));
 
-            let kzg_query = QueryBuilder::<FlatQuery>::default()
-                .key_exact(KZG_CONFIG_KEY)
+            let config_query = QueryBuilder::<FlatQuery>::default()
+                .key_exact(CONFIG_KEY)
                 .limit(1);
-            // there must be a better way to do this, but I want to ignore author for now
-            let kzg_entry = doc_stream.get_many(kzg_query.build()).await.unwrap();
-            let kzg = kzg_entry.collect::<Vec<_>>().await;
-            let hash = kzg[0].as_ref().unwrap().content_hash();
+            // there must be a better way to do this, but I want to ignore author for now...
+            let cfg_entry = doc_stream.get_many(config_query.build()).await.unwrap();
+            let config = cfg_entry.collect::<Vec<_>>().await;
+            let hash = config[0].as_ref().unwrap().content_hash();
             let mut content = node.blobs().read_to_bytes(hash).await.unwrap();
-            // try to decode an announcement
+            // try to decode an announcement (config accouncement)
             let a = Announcement::decode(&mut content.slice(..).to_vec().as_slice()).unwrap();
             // send it
             tx.send(a).unwrap();
-            // now load all previously published hints
+
+            // now load all previously published hints if not bootstrap
             // for now we can do this really simply by just looking at all indices less than our
-            for i in 0..(*index) as u32 {
-                // get the entry and extract the announcement
-                let hint_query = QueryBuilder::<FlatQuery>::default()
-                    .key_exact(i.to_string())
-                    .limit(1);
-                let entry_list = doc_stream.get_many(hint_query.build()).await.unwrap();
-                let entry = entry_list.collect::<Vec<_>>().await;
-                let hash = entry[0].as_ref().unwrap().content_hash();
-                let mut content = node.blobs().read_to_bytes(hash).await.unwrap();
-                let announcement =
-                    Announcement::decode(&mut content.slice(..).to_vec().as_slice()).unwrap();
-                tx.send(announcement).unwrap();
+            if !*is_bootstrap {
+                for i in 1..(*index) as u32 {
+                    // get the entry and extract the announcement
+                    let hint_query = QueryBuilder::<FlatQuery>::default()
+                        .key_exact(i.to_string())
+                        .limit(1);
+                    let entry_list = doc_stream.get_many(hint_query.build()).await.unwrap();
+                    let entry = entry_list.collect::<Vec<_>>().await;
+                    let hash = entry[0].as_ref().unwrap().content_hash();
+                    let mut content = node.blobs().read_to_bytes(hash).await.unwrap();
+                    let announcement =
+                        Announcement::decode(&mut content.slice(..).to_vec().as_slice()).unwrap();
+                    tx.send(announcement).unwrap();
+                }
             }
 
+            // make sure everything is synced
             thread::sleep(Duration::from_secs(1));
+
             // write your pubkey and hint and index
-            let pk = node
-                .lagrange_get_pk(*index, MAX_COMMITTEE_SIZE)
-                .await
-                .unwrap();
+            let pk = node.get_pk().await.unwrap();
             println!("Computed the hint");
             let mut pk_bytes = Vec::new();
             pk.serialize_compressed(&mut pk_bytes).unwrap();
@@ -322,7 +378,10 @@ async fn main() -> Result<()> {
                 tag: Tag::Hint,
                 data: pk_bytes,
             };
-            // finally send the hint
+
+            // send yourself your hint
+            tx.send(hint_announcement.clone()).unwrap();
+            // finally send the hint to peers
             let _ = doc_stream
                 .set_bytes(
                     node.docs().authors().default().await.unwrap(),
@@ -331,12 +390,11 @@ async fn main() -> Result<()> {
                 )
                 .await
                 .unwrap();
-            // send yourself your hitn
-            tx.send(hint_announcement).unwrap();
+
             // setup the RPC server
             let addr_str = format!("127.0.0.1:{}", rpc_port);
             let addr = addr_str.parse().unwrap();
-            let world = MyWorld {
+            let world = MyWorld::<E> {
                 state: arc_state_clone,
             };
             // the handle to run the RPC server, runs forever
@@ -365,7 +423,7 @@ async fn run_state_sync<C: Pairing>(
     node: Node<C>,
     tx: flume::Sender<Announcement>,
 ) {
-    // sync the doc with peers? we need to read the state of the doc and load it
+    // to sync the doc with peers we need to read the state of the doc and load it
     doc_stream.start_sync(vec![]).await.unwrap();
 
     // subscribe to changes to the doc
@@ -403,7 +461,7 @@ async fn run_state_sync<C: Pairing>(
     }
 }
 
-fn kzg_setup(size: usize) -> Vec<u8> {
+fn setup(size: usize) -> Vec<u8> {
     let config = Config::<E>::rand(size);
     let mut bytes = Vec::new();
     config.serialize_compressed(&mut bytes).unwrap();
@@ -411,9 +469,9 @@ fn kzg_setup(size: usize) -> Vec<u8> {
         .create(true)
         .write(true)
         .truncate(true)
-        .open("kzg.txt")
+        .open("config.txt")
         .unwrap();
-    let _ = write!(&mut file, "0x{}", hex::encode(bytes.clone())).unwrap();
+    let _ = write!(&mut file, "{}", hex::encode(bytes.clone())).unwrap();
     println!("> saved to disk");
     bytes
 }

@@ -25,8 +25,7 @@ use ark_std::{rand::rngs::OsRng, UniformRand, Zero};
 use silent_threshold_encryption::{
     decryption::agg_dec,
     encryption::encrypt,
-    kzg::KZG10,
-    setup::{AggregateKey, LagrangePowers, PublicKey, SecretKey},
+    setup::{PublicKey, SecretKey},
 };
 use std::{
     collections::HashMap,
@@ -51,7 +50,7 @@ pub(crate) type GossipClient = iroh_gossip::rpc::client::Client<
 >;
 
 /// A node...
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Node<C: Pairing> {
     /// the iroh endpoint
     endpoint: Endpoint,
@@ -61,7 +60,7 @@ pub struct Node<C: Pairing> {
     blobs: BlobsClient,
     /// docs client
     docs: DocsClient,
-    /// the iroh-gossip communication layer
+    /// the iroh-gossip protocol
     gossip: GossipClient,
     /// the secret key the node uses to sign messages
     iroh_secret_key: IrohSecretKey,
@@ -84,7 +83,7 @@ impl<C: Pairing> Node<C> {
 impl<C: Pairing> Node<C> {
     /// start the node
     pub async fn build(
-        params: StartNodeParams<C>, 
+        params: StartNodeParams<C>,
         rx: flume::Receiver<Announcement>,
         state: Arc<Mutex<State<C>>>,
     ) -> Self {
@@ -159,14 +158,9 @@ impl<C: Pairing> Node<C> {
         Ok(())
     }
 
-    pub async fn lagrange_get_pk(&self, i: usize, size: usize) -> Option<PublicKey<C>> {
+    pub async fn get_pk(&self) -> Option<PublicKey<C>> {
         if let Some(cfg) = &self.state.lock().await.config {
-            let size = cfg.size;
-            let lagrange_params = LagrangePowers::<C>::new(cfg.tau, size);
-            return Some(
-                self.secret_key
-                    .lagrange_get_pk(i, &lagrange_params, size),
-            );
+            return Some(self.secret_key.get_pk(&cfg.crs));
         }
 
         None

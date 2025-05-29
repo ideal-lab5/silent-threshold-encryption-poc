@@ -10,7 +10,7 @@ service World {
 message PreprocessRequest { }
 
 message PreprocessResponse {
-  string hex_serialized_aggregate_key = 1;
+  string hex_serialized_sys_key = 1;
 }
 
 message PartDecRequest {

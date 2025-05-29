@@ -14,12 +14,14 @@ use n0_future::{task, StreamExt};
 use ark_ec::pairing::Pairing;
 use ark_poly::univariate::DensePolynomial;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::{rand::rngs::OsRng, UniformRand, Zero};
+use ark_std::{UniformRand, Zero};
 use silent_threshold_encryption::{
+    aggregate::SystemPublicKeys,
+    crs::CRS,
     decryption::agg_dec,
-    encryption::{Ciphertext, encrypt},
-    kzg::KZG10,
-    setup::{AggregateKey, LagrangePowers, PublicKey, SecretKey},
+    encryption::encrypt,
+    setup::{PublicKey, SecretKey},
+    types::Ciphertext,
 };
 use std::{
     collections::HashMap,
@@ -54,23 +56,28 @@ impl<C: Pairing> World for MyWorld<C> {
         &self,
         request: Request<PreprocessRequest>,
     ) -> Result<Response<PreprocessResponse>, Status> {
-        let mut serialized_aggregate_key: Vec<u8> = vec![];
+        let mut serialized_sys_key: Vec<u8> = vec![];
 
         let state = self.state.lock().await;
+        if let (Some(config), Some(hints)) = (&state.config, &state.hints) {
+            let crs = &config.crs;
+            let lag_polys = &config.lag_polys;
+            // TODO: This shouldn't be hardcoded, send as parameter?
+            let k = 1;
+            println!("Computing the system public keys");
+            let system_keys = SystemPublicKeys::<C>::new(hints.clone(), crs, lag_polys, k);
 
-        if let Some(config) = &state.config {
-            let kzg_params = KZG10::<C, UniPoly381<C>>::setup(config.size, config.tau).unwrap();
-            let agg_key =
-                AggregateKey::<C>::new(state.hints.as_ref().unwrap().clone(), &kzg_params);
-            agg_key
-                .serialize_compressed(&mut serialized_aggregate_key)
+            system_keys
+                .serialize_compressed(&mut serialized_sys_key)
                 .unwrap();
-            println!("> Computed AggregateKey");
+
+            println!("> Computed system key");
         }
 
-        let hex_serialized_aggregate_key = hex::encode(serialized_aggregate_key);
+        let hex_serialized_sys_key = hex::encode(serialized_sys_key);
+
         Ok(Response::new(PreprocessResponse {
-            hex_serialized_aggregate_key,
+            hex_serialized_sys_key,
         }))
     }
 
@@ -80,13 +87,11 @@ impl<C: Pairing> World for MyWorld<C> {
         request: Request<PartDecRequest>,
     ) -> Result<Response<PartDecResponse>, Status> {
         let ciphertext_bytes = hex::decode(request.get_ref().ciphertext_hex.clone()).unwrap();
-        let bundle = CiphertextBundle::decode(&mut &ciphertext_bytes[..]).unwrap();
-        let key_ct_bytes = bundle.key_ciphertext;
-        let ciphertext = Ciphertext::<C>::deserialize_compressed(&key_ct_bytes[..]).unwrap();
+        let ciphertext = Ciphertext::<C>::deserialize_compressed(&ciphertext_bytes[..]).unwrap();
 
         let state = self.state.lock().await;
+        let mut partial_decryption = state.sk.partial_decryption(&ciphertext);
 
-        let partial_decryption = state.sk.partial_decryption(&ciphertext);
         let mut bytes = Vec::new();
         partial_decryption.serialize_compressed(&mut bytes).unwrap();
 

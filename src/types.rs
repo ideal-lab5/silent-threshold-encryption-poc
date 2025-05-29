@@ -12,14 +12,14 @@ use iroh_gossip::{
 use n0_future::{task, StreamExt};
 
 use ark_ec::pairing::Pairing;
-use ark_poly::{DenseUVPolynomial, univariate::DensePolynomial};
+use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{rand::rngs::OsRng, UniformRand, Zero};
 use silent_threshold_encryption::{
+    crs::CRS,
     decryption::agg_dec,
     encryption::encrypt,
-    kzg::KZG10,
-    setup::{AggregateKey, LagrangePowers, PublicKey, SecretKey},
+    setup::{LagPolys, PublicKey, SecretKey},
 };
 use std::{
     collections::HashMap,
@@ -30,7 +30,7 @@ use std::{
 
 use codec::{Decode, Encode};
 
-pub(crate) const KZG_CONFIG_KEY: &str = "kzg-config-key";
+pub(crate) const CONFIG_KEY: &str = "config-key";
 
 pub(crate) type E = ark_bls12_381::Bls12_381;
 pub(crate) type G2 = <E as Pairing>::G2;
@@ -54,7 +54,7 @@ pub struct StartNodeParams<C: Pairing> {
     pub(crate) secret_key: SecretKey<C>,
     pub(crate) bind_port: u16,
     pub(crate) rpc_port: u16,
-    pub(crate) index: usize, 
+    pub(crate) index: usize,
     pub(crate) bootstrap_peers: Option<Vec<NodeAddr>>,
 }
 
@@ -68,7 +68,7 @@ impl<C: Pairing> StartNodeParams<C> {
     ) -> Self {
         Self {
             iroh_secret_key: IrohSecretKey::generate(OsRng),
-            secret_key: SecretKey::<C>::new(&mut OsRng),
+            secret_key: SecretKey::<C>::new(&mut OsRng, index),
             bind_port,
             rpc_port,
             index,
@@ -77,37 +77,30 @@ impl<C: Pairing> StartNodeParams<C> {
     }
 }
 
-#[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize)]
+#[derive(Clone, CanonicalDeserialize, CanonicalSerialize)]
 pub(crate) struct Config<C: Pairing> {
-    pub dummy: PublicKey<C>,
-    pub tau: <C as Pairing>::ScalarField,
+    pub crs: CRS<C>,
+    pub lag_polys: LagPolys<<C as Pairing>::ScalarField>,
     pub size: usize,
 }
 
 impl<C: Pairing> Config<C> {
     pub fn rand(size: usize) -> Self {
-        let tau = <C as Pairing>::ScalarField::rand(&mut OsRng);
-        let sk = SecretKey::<C>::new(&mut OsRng);
-        let lagrange_params = LagrangePowers::<C>::new(tau, size);
-        let dummy = sk.lagrange_get_pk(0, &lagrange_params, size);
-        Self { dummy, tau, size }
+        let crs = CRS::<C>::new(size, &mut OsRng);
+        let lag_polys = LagPolys::<<C as Pairing>::ScalarField>::new(size);
+        Self {
+            crs,
+            lag_polys,
+            size,
+        }
     }
 }
 
-#[derive(Debug, Decode, Encode)]
-pub struct CiphertextBundle {
-    pub key_ciphertext: Vec<u8>,
-    pub message_ciphertext: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct State<C: Pairing> {
     pub config: Option<Config<C>>,
     pub hints: Option<Vec<PublicKey<C>>>,
-    // TODO: This is proof of concept only, so it's fine for now
-    // but in the future, we should instead have a secure vault for key mgmt
-    // this is only here right now to make it easy to build partial decryptions
-    // from the RPC context
+    // TODO: secure vault for key mgmt
     pub sk: SecretKey<C>,
 }
 
@@ -124,18 +117,21 @@ impl<C: Pairing> State<C> {
         match announcement.tag {
             Tag::Config => {
                 println!("Received Config");
-                let config: Config<C> = Config::deserialize_compressed(&announcement.data[..]).unwrap();
+                let config: Config<C> =
+                    Config::deserialize_compressed(&announcement.data[..]).unwrap();
                 self.config = Some(config.clone());
-                self.hints = Some(vec![config.dummy]);
-            },
+            }
             Tag::Hint => {
-                println!("Received Hint");
-                let hint: PublicKey<C> = PublicKey::deserialize_compressed(&announcement.data[..]).unwrap();
+                println!("Received sHint");
+                let hint: PublicKey<C> =
+                    PublicKey::deserialize_compressed(&announcement.data[..]).unwrap();
                 if let Some(h) = &self.hints {
                     let mut hints = h.clone();
                     hints.push(hint);
                     self.hints = Some(hints.clone());
-                };
+                } else {
+                    self.hints = Some(vec![hint]);
+                }
             }
         }
     }
